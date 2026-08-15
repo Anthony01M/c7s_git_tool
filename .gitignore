@@ -1,0 +1,4 @@
+extensions/
+dist/
+*.c7s.zip
+.env
