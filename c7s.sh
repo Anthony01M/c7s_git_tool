@@ -117,6 +117,68 @@ cmd_install_all() {
   cd "$PANEL_DIR/frontend" && pnpm install
 }
 
+# extensions resync and pnpm install rewrite tracked panel files, which is
+# enough for git pull to refuse. They are regenerated at the end of an update,
+# so they are restored instead of being stashed.
+GENERATED_PATHS=(Cargo.lock backend-extensions/internal-list frontend/pnpm-lock.yaml)
+
+cmd_update() {
+  local discard=0 build=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --discard) discard=1 ;;
+      --build)   build=1 ;;
+      *)         die "usage: c7s update [--discard] [--build]" ;;
+    esac
+  done
+
+  cd "$PANEL_DIR"
+  git rev-parse --git-dir >/dev/null 2>&1 || die "$PANEL_DIR is not a git checkout"
+
+  local path
+  for path in "${GENERATED_PATHS[@]}"; do
+    git checkout -q HEAD -- "$path" 2>/dev/null || true
+  done
+
+  local dirty
+  dirty="$(git status --porcelain --untracked-files=no)"
+  if [ -n "$dirty" ]; then
+    printf '%s\n' "$dirty"
+    if [ "$discard" -eq 1 ]; then
+      git reset -q --hard
+      printf 'discarded the panel changes above\n'
+    else
+      git stash push -q -m "c7s update $(date '+%Y-%m-%d %H:%M')"
+      printf 'stashed the panel changes above, recover with: git -C %s stash pop\n' "$PANEL_DIR"
+    fi
+  fi
+
+  local before after
+  before="$(git rev-parse HEAD)"
+  git pull --ff-only ||
+    die "git pull failed, the panel checkout has diverged from origin, reset it with:
+
+  git -C $PANEL_DIR reset --hard origin/$(git branch --show-current)"
+  after="$(git rev-parse HEAD)"
+
+  if [ "$before" = "$after" ]; then
+    printf 'already up to date at %s\n' "$(git log -1 --format='%h %s')"
+  else
+    git --no-pager log --oneline "$before..$after"
+  fi
+
+  if [ "$build" -eq 1 ]; then
+    SQLX_OFFLINE=true cargo build -p panel-rs
+  fi
+
+  "$(panel_rs)" extensions resync >/dev/null
+  cd "$PANEL_DIR/frontend" && pnpm install
+
+  if [ "$build" -eq 0 ]; then
+    printf 'rebuild the panel with: cd %s && SQLX_OFFLINE=true cargo build -p panel-rs\n' "$PANEL_DIR"
+  fi
+}
+
 cmd_export() {
   local package="${1:-}"
   [ -n "$package" ] || die "usage: c7s export <package.name>"
@@ -292,6 +354,7 @@ c7s only moves that code in and out of git and builds archives.
   c7s pull    <package.name>            panel -> repository, without committing
   c7s install <package.name>            repository -> panel (after a panel update)
   c7s install-all                       reinstall every extension into the panel
+  c7s update  [--discard] [--build]     git pull the panel, around your local changes
   c7s clone   <repo-name>               clone a repo and install it into the panel
   c7s config                            show where c7s thinks everything is
 
@@ -307,7 +370,7 @@ USAGE
 }
 
 case "${1:-}" in
-  pull|install|install-all|export|new|repo|commit|release|clone|status|list)
+  pull|install|install-all|update|export|new|repo|commit|release|clone|status|list)
     resolve_panel_dir ;;
 esac
 
@@ -315,6 +378,7 @@ case "${1:-}" in
   pull)        shift; cmd_pull "$@" ;;
   install)     shift; cmd_install "$@" ;;
   install-all) shift; cmd_install_all "$@" ;;
+  update)      shift; cmd_update "$@" ;;
   export)      shift; cmd_export "$@" ;;
   new)         shift; cmd_new "$@" ;;
   repo)        shift; cmd_repo "$@" ;;

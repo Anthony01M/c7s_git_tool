@@ -1,6 +1,6 @@
 # c7s
 
-Tooling for developing [Calagopus](https://github.com/pterodactyl-rs/panel) panel extensions.
+Tooling for developing [Calagopus](https://github.com/calagopus/panel) panel extensions.
 It moves an extension between the panel checkout you have to build it in and the git
 repository you actually want to keep it in, and it builds the shippable archive.
 
@@ -80,6 +80,7 @@ Identifiers, packages and repository names are three views of the same thing:
 | `c7s pull <package>` | Panel → repository, no commit. `commit` calls this for you. |
 | `c7s install <package>` | Repository → panel, then `extensions resync`. |
 | `c7s install-all` | Every extension back into the panel, then `pnpm install`. |
+| `c7s update [--discard] [--build]` | `git pull` the panel past whatever you changed inside it. |
 | `c7s clone <repo-name>` | Clone from GitHub and install into the panel. Takes `owner/name` too. |
 | `c7s config` | Show where c7s thinks everything is. |
 
@@ -110,6 +111,38 @@ c7s install-all
 
 Every extension is copied back and resynced. This is the reason the repositories exist —
 you never have to hand-restore `backend-extensions/` after wiping the panel.
+
+**The panel is out of date, and `git pull` says "Please commit your changes or stash them
+before you merge".**
+
+```bash
+c7s update
+```
+
+Most of the time that message is not about anything you wrote. `extensions resync` and
+`pnpm install` rewrite `Cargo.lock`, `backend-extensions/internal-list/` and
+`frontend/pnpm-lock.yaml` every time you touch an extension, and those four files are the
+whole reason the pull refuses. `c7s update` restores them from `HEAD`, fast-forwards, then
+regenerates them with `extensions resync` and `pnpm install` — nothing is lost, because
+nothing there was written by hand.
+
+Panel source you did edit is **stashed**, listed before it goes, and comes back with:
+
+```bash
+git -C <panel> stash pop
+```
+
+`--discard` throws those edits away instead of stashing them, for when the panel is dirty
+because you were poking at it and you know you want none of it. `--build` also runs
+`SQLX_OFFLINE=true cargo build -p panel-rs`; without it you get the command printed at the
+end to run yourself.
+
+Your extensions are untracked in the panel's git repository, so neither the pull nor the
+stash can touch `backend-extensions/<identifier>/`. If a pull ever does clobber one,
+`c7s install-all` puts it back.
+
+Only a fast-forward is attempted. If it fails, the checkout has local commits — you were
+not supposed to commit to the panel, and the error tells you how to reset it.
 
 **I want a shippable archive.**
 
