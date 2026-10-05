@@ -21,7 +21,7 @@ This is not a style preference, it is forced by the panel's build. See
 ## Install
 
 ```bash
-git clone https://github.com/<you>/c7s.git
+git clone https://github.com/Anthony01M/c7s_git_tool.git
 ln -s "$PWD/c7s/c7s.sh" /usr/local/bin/c7s
 ```
 
