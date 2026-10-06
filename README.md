@@ -73,16 +73,54 @@ Identifiers, packages and repository names are three views of the same thing:
 | --- | --- |
 | `c7s status` | Per extension: in sync, panel has uncommitted changes, or missing from the panel. |
 | `c7s new <package>` | Scaffolds via `panel-rs extensions init`, creates the repository, makes the first commit. |
-| `c7s commit <package> [msg]` | **The one you use most.** Pulls the panel's version into the repository, commits, pushes if a remote exists. |
-| `c7s export <package>` | Runs the panel's export (all its checks) and copies the archive to `<repo>/dist`. |
-| `c7s release <package> [tag]` | Export, commit, then attach the archive to a GitHub release. Tag defaults to `v<version from Cargo.toml>`. |
-| `c7s repo <package> [name]` | Creates the GitHub repo and pushes. Needs `gh` authenticated. |
-| `c7s pull <package>` | Panel → repository, no commit. `commit` calls this for you. |
-| `c7s install <package>` | Repository → panel, then `extensions resync`. |
+| `c7s commit [package...] [msg]` | **The one you use most.** Pulls the panel's version into the repository, commits, pushes if a remote exists. |
+| `c7s export [package...]` | Runs the panel's export (all its checks) and copies the archive to `<repo>/dist`. |
+| `c7s release [package...] [tag]` | Export, commit, then attach the archive to a GitHub release. Tag defaults to `v<version from Cargo.toml>`. |
+| `c7s repo [package...] [name]` | Creates the GitHub repo and pushes. Needs `gh` authenticated. |
+| `c7s pull [package...]` | Panel → repository, no commit. `commit` calls this for you. |
+| `c7s install [package...]` | Repository → panel, then `extensions resync`. |
 | `c7s install-all` | Every extension back into the panel, then `pnpm install`. |
 | `c7s update [--discard] [--build]` | `git pull` the panel past whatever you changed inside it. |
 | `c7s clone <repo-name>` | Clone from GitHub and install into the panel. Takes `owner/name` too. |
+| `c7s run [package...]` | Start a throwaway panel with only these extensions. `--logs`, `--stop`, `--destroy`. |
 | `c7s config` | Show where c7s thinks everything is. |
+
+### Picking extensions
+
+`commit`, `export`, `release`, `repo`, `pull` and `install` take any number of package
+names. Leave them out and c7s opens a scrollable checklist of your extensions instead, each
+shown with its sync state: `fzf --multi` if it is installed (tab selects, ctrl-a selects
+all), otherwise `whiptail` (space selects, enter confirms, esc cancels). `commit` ticks the
+extensions with uncommitted panel changes for you.
+
+```bash
+c7s commit                                          # pick from the list
+c7s export com.example.autologin com.example.theme  # or name them
+c7s commit com.example.autologin com.example.theme "fix: shared typo"
+```
+
+Each package runs on its own, so one failing does not stop the rest; a summary of what
+failed is printed at the end. Without a terminal (scripts, CI) the list cannot open, so
+pass the names.
+
+### A throwaway panel with only some extensions
+
+`c7s run [package...]` starts a separate panel (its own Postgres, Valkey and heavy panel
+container, compose project `c7s-run`) with **only** the extensions you name or pick. Use it to
+prove an extension works on its own before sharing it. Nothing touches your real panel.
+
+```bash
+c7s run com.example.autologin   # or just: c7s run, and pick
+c7s run --logs                  # follow the first start, which compiles the panel
+c7s run --stop                  # stop it, keeping its data
+c7s run --destroy               # remove it and everything it stored
+```
+
+Each run reuses an extension's archive from `<repo>/dist` unless the extension changed since,
+in which case it is exported first. The panel container is recreated every run, so
+extensions from an earlier run are gone. It listens on `127.0.0.1:8090` and is capped at 6 GB
+of memory with 2 compile jobs; change that with `RUN_BIND`, `RUN_PORT`, `RUN_MEMORY`,
+`RUN_JOBS`, `RUN_IMAGE` and `RUN_DIR` (default `~/.local/share/c7s/run`).
 
 ## Workflows
 

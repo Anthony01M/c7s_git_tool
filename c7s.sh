@@ -12,8 +12,22 @@ EXTENSIONS_DIR="${EXTENSIONS_DIR:-$SCRIPT_DIR/extensions}"
 GITHUB_USER="${GITHUB_USER:-}"
 REPO_PREFIX="${REPO_PREFIX:-c7s_extension_}"
 REPO_VISIBILITY="${REPO_VISIBILITY:-private}"
+RUN_DIR="${RUN_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/c7s/run}"
+RUN_IMAGE="${RUN_IMAGE:-ghcr.io/calagopus/panel:heavy}"
+RUN_BIND="${RUN_BIND:-127.0.0.1}"
+RUN_PORT="${RUN_PORT:-8090}"
+RUN_MEMORY="${RUN_MEMORY:-6g}"
+RUN_JOBS="${RUN_JOBS:-2}"
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
+
+PACKAGE_RE='^[a-z]{2,6}\.[a-z0-9-]{3,30}\.[a-z0-9-]{4,30}$'
+is_package() { [[ "$1" =~ $PACKAGE_RE ]]; }
+
+package_in() {
+  [ -f "$1/Metadata.toml" ] || return 0
+  sed -n 's/^package_name = "\(.*\)"/\1/p' "$1/Metadata.toml"
+}
 
 identifier_of() { printf '%s' "${1//./_}"; }
 repo_of() { printf '%s%s' "$REPO_PREFIX" "${1##*.}"; }
@@ -221,6 +235,7 @@ cmd_repo() {
   local package="${1:-}"
   [ -n "$package" ] || die "usage: c7s repo <package.name> [repo-name]"
   local repo name user
+  [ "$#" -le 2 ] || die "usage: c7s repo <package.name> [repo-name]"
   repo="$(repo_dir_of "$package")"
   name="${2:-$(repo_of "$package")}"
   [ -d "$repo" ] || die "no repository at $repo, run: c7s pull $package"
@@ -302,25 +317,117 @@ cmd_clone() {
   cmd_install "$package"
 }
 
+state_of() {
+  local repo panel
+  repo="$(repo_dir_of "$1")"
+  panel="$(panel_dir_of "$1")"
+  if [ ! -d "$repo" ]; then
+    printf 'no repository'
+  elif [ ! -d "$panel" ]; then
+    printf 'missing from panel'
+  elif diff -rq --exclude node_modules --exclude dist --exclude .git \
+    "$repo/frontend" "$panel/frontend" >/dev/null 2>&1 &&
+    diff -rq "$repo/backend/src" "$panel/src" >/dev/null 2>&1 &&
+    { [ ! -d "$panel/migrations" ] || diff -rq --exclude .gitkeep "$repo/migrations" "$panel/migrations" >/dev/null 2>&1; }; then
+    printf 'in sync'
+  else
+    printf 'panel has changes'
+  fi
+}
+
+# Packages a command can act on: "panel" lists what is in the panel checkout,
+# "repo" lists what has a repository, for commands that copy the other way.
+packages_from() {
+  local dir
+  if [ "$1" = repo ]; then
+    for dir in "$EXTENSIONS_DIR"/*/; do package_in "$dir"; printf '\n'; done
+  else
+    for dir in "$PANEL_DIR"/backend-extensions/*/; do package_in "$dir"; printf '\n'; done
+  fi | grep -E "$PACKAGE_RE" | sort -u
+}
+
+# Scrollable multi-select. fzf when it is installed, whiptail otherwise.
+# Prints one selected package per line.
+pick() {
+  local title="$1" source="$2" preselect="$3"
+  local packages=() package state
+  mapfile -t packages < <(packages_from "$source")
+  [ "${#packages[@]}" -gt 0 ] || die "no extensions found to pick from"
+  [ -t 0 ] && [ -t 2 ] || die "no package given, and no terminal to pick from. Pass the package names instead."
+
+  if command -v fzf >/dev/null 2>&1; then
+    for package in "${packages[@]}"; do
+      printf '%-32s %s\n' "$package" "$(state_of "$package")"
+    done | fzf --multi --reverse --height=80% --prompt="$title > " \
+      --header='tab selects, enter confirms' --bind 'ctrl-a:select-all' |
+      awk '{print $1}'
+    return
+  fi
+
+  command -v whiptail >/dev/null 2>&1 || die "install fzf or whiptail to pick extensions, or pass the package names"
+
+  local items=() on
+  for package in "${packages[@]}"; do
+    state="$(state_of "$package")"
+    on=OFF
+    [ "$preselect" = changed ] && [ "$state" = 'panel has changes' ] && on=ON
+    items+=("$package" "$state" "$on")
+  done
+
+  local rows cols list
+  rows="$(tput lines 2>/dev/null || printf 24)"
+  cols="$(tput cols 2>/dev/null || printf 80)"
+  list=$(( rows - 8 ))
+  [ "$list" -gt "${#packages[@]}" ] && list="${#packages[@]}"
+  [ "$list" -lt 1 ] && list=1
+
+  whiptail --title "c7s $title" --separate-output \
+    --checklist 'space selects, enter confirms, esc cancels' \
+    "$(( list + 8 ))" "$(( cols < 90 ? cols : 90 ))" "$list" "${items[@]}" \
+    3>&1 1>&2 2>&3 || die "cancelled"
+}
+
+# Runs a per-package command for every package given, or for every package
+# picked when none is given. Arguments that are not package names are passed
+# on to each run, so `c7s commit a.b.cdef x.y.zzzz "fix: thing"` works.
+run_many() {
+  local fn="$1" title="$2" source="$3" preselect="$4"
+  shift 4
+  local packages=() rest=() arg
+  for arg in "$@"; do
+    if is_package "$arg"; then packages+=("$arg"); else rest+=("$arg"); fi
+  done
+
+  if [ "${#packages[@]}" -eq 0 ]; then
+    local picked
+    picked="$(pick "$title" "$source" "$preselect")" || exit 1
+    [ -n "$picked" ] && mapfile -t packages <<<"$picked"
+  fi
+  [ "${#packages[@]}" -gt 0 ] || die "nothing selected"
+
+  local failed=() package status
+  for package in "${packages[@]}"; do
+    [ "${#packages[@]}" -gt 1 ] && printf '\n== %s %s\n' "$title" "$package"
+    set +e
+    ( set -e; "$fn" "$package" "${rest[@]}" )
+    status=$?
+    set -e
+    [ "$status" -eq 0 ] || failed+=("$package")
+  done
+
+  if [ "${#packages[@]}" -gt 1 ]; then
+    printf '\n%s: %d done, %d failed%s\n' "$title" \
+      "$(( ${#packages[@]} - ${#failed[@]} ))" "${#failed[@]}" \
+      "$([ "${#failed[@]}" -gt 0 ] && printf ' (%s)' "${failed[*]}")"
+  fi
+  [ "${#failed[@]}" -eq 0 ]
+}
+
 cmd_status() {
-  local dir package panel state
+  local package
   [ -d "$EXTENSIONS_DIR" ] || die "no repositories at $EXTENSIONS_DIR"
-  for dir in "$EXTENSIONS_DIR"/*/; do
-    [ -f "$dir/Metadata.toml" ] || continue
-    package="$(sed -n 's/^package_name = "\(.*\)"/\1/p' "$dir/Metadata.toml")"
-    panel="$(panel_dir_of "$package")"
-
-    if [ ! -d "$panel" ]; then
-      state='missing from panel'
-    elif diff -rq --exclude node_modules --exclude dist --exclude .git \
-      "$dir/frontend" "$panel/frontend" >/dev/null 2>&1 &&
-      diff -rq "$dir/backend/src" "$panel/src" >/dev/null 2>&1; then
-      state='in sync'
-    else
-      state='panel has changes, run: c7s commit'
-    fi
-
-    printf '%-28s %s\n' "$package" "$state"
+  for package in $(packages_from repo); do
+    printf '%-28s %s\n' "$package" "$(state_of "$package" | sed 's/^panel has changes$/panel has changes, run: c7s commit/')"
   done
 }
 
@@ -336,6 +443,123 @@ cmd_config() {
   printf 'REPO_PREFIX     %s\n' "$REPO_PREFIX"
   printf 'REPO_VISIBILITY %s\n' "$REPO_VISIBILITY"
   printf 'panel-rs        %s\n' "$(panel_rs 2>/dev/null || printf '(not found)')"
+  printf 'RUN_DIR         %s (port %s:%s, %s RAM)\n' "$RUN_DIR" "$RUN_BIND" "$RUN_PORT" "$RUN_MEMORY"
+}
+
+# A throwaway panel with only the picked extensions, in its own compose
+# project, so an extension can be tried without anything else installed.
+run_compose() { docker compose -p c7s-run -f "$RUN_DIR/compose.yml" "$@"; }
+
+# The existing archive is reused unless the extension changed after it was built.
+archive_for() {
+  local package="$1" identifier archive panel
+  identifier="$(identifier_of "$package")"
+  archive="$(repo_dir_of "$package")/dist/$identifier.c7s.zip"
+  panel="$(panel_dir_of "$package")"
+
+  if [ ! -f "$archive" ] || [ -n "$(find "$panel" -path "$panel/frontend/node_modules" -prune -o -newer "$archive" -type f -print -quit)" ]; then
+    ( cmd_export "$package" ) >&2 || return 1
+  fi
+  printf '%s' "$archive"
+}
+
+write_run_compose() {
+  mkdir -p "$RUN_DIR"/{extensions,binaries,translations,extension-migrations,data,logs,postgres,cache}
+  [ -f "$RUN_DIR/.key" ] || head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 > "$RUN_DIR/.key"
+
+  cat > "$RUN_DIR/compose.yml" <<EOF
+services:
+  web:
+    image: $RUN_IMAGE
+    mem_limit: $RUN_MEMORY
+    environment:
+      - REDIS_URL=redis://cache
+      - DATABASE_URL=postgresql://panel:panel@db/panel
+      - DATABASE_MIGRATE=true
+      - PORT=8004
+      - APP_PRIMARY=true
+      - APP_ENCRYPTION_KEY=$(cat "$RUN_DIR/.key")
+      - CARGO_BUILD_JOBS=$RUN_JOBS
+      - NODE_OPTIONS=--max-old-space-size=3072
+    volumes:
+      - ./data:/var/lib/calagopus
+      - ./logs:/var/log/calagopus
+      - ./binaries:/app/binaries
+      - ./translations:/app/translations
+      - ./extensions:/app/extensions
+      - ./extension-migrations:/app/repo/database/extension-migrations
+    ports:
+      - $RUN_BIND:$RUN_PORT:8004
+    depends_on:
+      - db
+      - cache
+  db:
+    image: ghcr.io/calagopus/pgautoupgrade:18-alpine
+    environment:
+      - POSTGRES_USER=panel
+      - POSTGRES_PASSWORD=panel
+      - POSTGRES_DB=panel
+      - PGDATA=/data
+    volumes:
+      - ./postgres:/data
+  cache:
+    image: ghcr.io/calagopus/valkey:latest
+    command: --protected-mode no
+    volumes:
+      - ./cache:/data
+EOF
+}
+
+cmd_run() {
+  command -v docker >/dev/null 2>&1 || die "c7s run needs docker"
+
+  case "${1:-}" in
+    --stop)
+      [ -f "$RUN_DIR/compose.yml" ] || die "no test panel at $RUN_DIR"
+      run_compose stop
+      return ;;
+    --logs)
+      [ -f "$RUN_DIR/compose.yml" ] || die "no test panel at $RUN_DIR"
+      run_compose logs -f --tail 100 web
+      return ;;
+    --destroy)
+      [ -f "$RUN_DIR/compose.yml" ] && run_compose down -v --remove-orphans
+      rm -rf "$RUN_DIR"
+      printf 'removed the test panel and all of its data at %s\n' "$RUN_DIR"
+      return ;;
+  esac
+
+  local packages=() arg
+  for arg in "$@"; do
+    is_package "$arg" || die "usage: c7s run [package.name...] | --stop | --logs | --destroy"
+    packages+=("$arg")
+  done
+  if [ "${#packages[@]}" -eq 0 ]; then
+    local picked
+    picked="$(pick "run" panel none)" || exit 1
+    [ -n "$picked" ] && mapfile -t packages <<<"$picked"
+  fi
+  [ "${#packages[@]}" -gt 0 ] || die "nothing selected"
+
+  local archives=() package archive
+  for package in "${packages[@]}"; do
+    archive="$(archive_for "$package")" || die "could not build an archive for $package"
+    archives+=("$archive")
+  done
+
+  write_run_compose
+  rm -f "$RUN_DIR"/extensions/*.c7s.zip
+  cp "${archives[@]}" "$RUN_DIR/extensions/"
+
+  run_compose up -d db cache
+  run_compose up -d --force-recreate web
+
+  printf '\ntest panel starting with only:\n'
+  printf '  %s\n' "${packages[@]}"
+  printf '\nurl      http://%s:%s\n' "$RUN_BIND" "$RUN_PORT"
+  printf 'build    the first start compiles the panel with these extensions, follow it with: c7s run --logs\n'
+  printf 'limits   %s RAM, %s compile jobs (RUN_MEMORY, RUN_JOBS)\n' "$RUN_MEMORY" "$RUN_JOBS"
+  printf 'stop     c7s run --stop    remove everything: c7s run --destroy\n'
 }
 
 usage() {
@@ -345,17 +569,23 @@ c7s - git, export and import for Calagopus panel extensions
 You develop inside the panel checkout, at backend-extensions/<identifier>.
 c7s only moves that code in and out of git and builds archives.
 
-  c7s status                            what the panel has that git does not
-  c7s new     <package.name>            scaffold an extension and its repository
-  c7s commit  <package.name> [message]  pull from the panel, commit and push
-  c7s export  <package.name>            build the .c7s.zip into <repo>/dist
-  c7s release <package.name> [tag]      export, commit and attach to a GitHub release
-  c7s repo    <package.name> [name]     create the GitHub repo and push
-  c7s pull    <package.name>            panel -> repository, without committing
-  c7s install <package.name>            repository -> panel (after a panel update)
-  c7s install-all                       reinstall every extension into the panel
+  c7s status                              what the panel has that git does not
+  c7s new     <package.name>              scaffold an extension and its repository
+  c7s commit  [package.name...] [message] pull from the panel, commit and push
+  c7s export  [package.name...]           build the .c7s.zip into <repo>/dist
+  c7s release [package.name...] [tag]     export, commit and attach to a GitHub release
+  c7s repo    [package.name...] [name]    create the GitHub repo and push
+  c7s pull    [package.name...]           panel -> repository, without committing
+  c7s install [package.name...]           repository -> panel (after a panel update)
+  c7s install-all                         reinstall every extension into the panel
+
+Commands that take [package.name...] accept several packages. Leave them out
+to pick from a scrollable list instead (fzf if installed, otherwise whiptail).
+commit ticks the extensions that have uncommitted panel changes for you.
   c7s update  [--discard] [--build]     git pull the panel, around your local changes
   c7s clone   <repo-name>               clone a repo and install it into the panel
+  c7s run     [package.name...]           start a throwaway panel with only these extensions
+  c7s run     --stop | --logs | --destroy stop it, follow its build, or delete it and its data
   c7s config                            show where c7s thinks everything is
 
 Configuration, read from the environment or from
@@ -366,26 +596,31 @@ $XDG_CONFIG_HOME/c7s/config (default ~/.config/c7s/config):
   GITHUB_USER     repo owner (default: the account gh is logged in as)
   REPO_PREFIX     repo name prefix (default c7s_extension_)
   REPO_VISIBILITY private or public, for repos c7s creates (default private)
+  RUN_DIR         where the test panel lives (default ~/.local/share/c7s/run)
+  RUN_PORT        its port (default 8090), RUN_BIND its address (default 127.0.0.1)
+  RUN_MEMORY      its memory cap (default 6g), RUN_JOBS compile jobs (default 2)
+  RUN_IMAGE       panel image (default ghcr.io/calagopus/panel:heavy)
 USAGE
 }
 
 case "${1:-}" in
-  pull|install|install-all|update|export|new|repo|commit|release|clone|status|list)
+  pull|install|install-all|update|export|new|repo|commit|release|clone|status|list|run)
     resolve_panel_dir ;;
 esac
 
 case "${1:-}" in
-  pull)        shift; cmd_pull "$@" ;;
-  install)     shift; cmd_install "$@" ;;
+  pull)        shift; run_many cmd_pull pull panel none "$@" ;;
+  install)     shift; run_many cmd_install install repo none "$@" ;;
   install-all) shift; cmd_install_all "$@" ;;
   update)      shift; cmd_update "$@" ;;
-  export)      shift; cmd_export "$@" ;;
+  export)      shift; run_many cmd_export export panel none "$@" ;;
   new)         shift; cmd_new "$@" ;;
-  repo)        shift; cmd_repo "$@" ;;
-  commit)      shift; cmd_commit "$@" ;;
-  release)     shift; cmd_release "$@" ;;
+  repo)        shift; run_many cmd_repo repo panel none "$@" ;;
+  commit)      shift; run_many cmd_commit commit panel changed "$@" ;;
+  release)     shift; run_many cmd_release release panel none "$@" ;;
   clone)       shift; cmd_clone "$@" ;;
   status|list) shift; cmd_status "$@" ;;
+  run)         shift; cmd_run "$@" ;;
   config)      shift; cmd_config "$@" ;;
   *)           usage ;;
 esac
